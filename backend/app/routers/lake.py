@@ -1,4 +1,8 @@
-"""数据湖存储接口：维护湖存储节点，覆盖启动节点、暂停节点、归档节点等动作。"""
+"""数据湖存储接口：维护湖存储节点，覆盖启动节点、暂停节点、归档节点等动作。
+
+另挂容量规划视图：与分区策略页的预览/执行共用同一份计算，
+湖页看到的预计占用、计划释放与不可迁移原因不会和分区页打架。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,12 +11,14 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.lake import LakeService
+from app.services.partition_plan import PartitionPlanService
 
 router = APIRouter(prefix="/api/lake", tags=["数据湖存储"])
 
 service = LakeService()
+plan_service = PartitionPlanService()
 
-LIST_FIELDS = ["节点编号", "存储路径", "文件格式", "压缩方式", "总容量", "已用容量", "访问策略", "节点状态"]
+LIST_FIELDS = ["节点编号", "存储路径", "文件格式", "压缩方式", "总容量", "已用容量", "访问策略", "节点状态", "节点层级"]
 STATUSES = ["草稿", "运行中", "已暂停", "已归档"]
 
 
@@ -28,6 +34,15 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/plan-impact")
+def plan_impact() -> dict[str, Any]:
+    """分区规划容量视图：候选节点、预计增量、会被释放的旧分区与不可迁移原因。
+
+    数据来自分区规划同一份计算；执行后节点已用容量变化会实时反映在这里。
+    """
+    return plan_service.lake_impact()
 
 
 @router.get("/{entry_id}", response_model=dict)

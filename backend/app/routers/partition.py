@@ -1,4 +1,8 @@
-"""分区策略接口：维护分区配置，覆盖提交审批、发布配置、停用配置等动作。"""
+"""分区策略接口：维护分区配置，覆盖提交审批、发布配置、停用配置等动作。
+
+另挂分区规划端点：预览只试算不动数据，执行按分区键幂等创建，
+容量不足停在失败分区，之后可从断点继续。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,12 +11,14 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.partition import PartitionService
+from app.services.partition_plan import PartitionPlanService
 
 router = APIRouter(prefix="/api/partition", tags=["分区策略"])
 
 service = PartitionService()
+plan_service = PartitionPlanService()
 
-LIST_FIELDS = ["配置编号", "表名称", "分区字段", "分区类型", "保留天数", "预建天数", "冷热分离", "存储路径"]
+LIST_FIELDS = ["配置编号", "表名称", "分区字段", "分区类型", "保留天数", "预建天数", "冷热分离", "存储路径", "生效时间"]
 STATUSES = ["草稿", "待审批", "已生效", "已停用"]
 
 
@@ -28,6 +34,50 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.post("/plans/preview", response_model=ActionResult)
+def preview_plan(payload: EntryPayload) -> ActionResult:
+    """生成一次分区规划预览：按分区字段、预建天数、保留天数、冷热分离、文件格式
+    试算待创建分区与湖容量占用；只登记规划单，不创建分区、不删除任何数据。"""
+    plan, message = plan_service.preview(payload.values)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=plan)
+
+
+@router.get("/plans")
+def list_plans() -> dict[str, Any]:
+    """分区规划单列表：每次预览都会落一单，便于审计与断点续跑。"""
+    plans = plan_service.list_plans()
+    return {"module": "partition_plans", "total": len(plans), "items": plans}
+
+
+@router.get("/plans/{plan_id}")
+def get_plan(plan_id: int) -> dict[str, Any]:
+    """读取单条分区规划明细；不存在时给出可读的错误说明。"""
+    plan = plan_service.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"分区规划 {plan_id} 不存在或已归档")
+    return plan
+
+
+@router.post("/plans/{plan_id}/execute", response_model=ActionResult)
+def execute_plan(plan_id: int) -> ActionResult:
+    """确认执行：按分区键幂等创建；容量不足停在失败分区并保留已完成部分。"""
+    plan, message = plan_service.execute(plan_id)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=plan.get("status") == "已完成", message=message, entry=plan)
+
+
+@router.post("/plans/{plan_id}/resume", response_model=ActionResult)
+def resume_plan(plan_id: int) -> ActionResult:
+    """断点续跑：从上次失败分区继续，已建分区按分区键幂等跳过，不重复建满。"""
+    plan, message = plan_service.execute(plan_id, resumed=True)
+    if plan is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=plan.get("status") == "已完成", message=message, entry=plan)
 
 
 @router.get("/{entry_id}", response_model=dict)
